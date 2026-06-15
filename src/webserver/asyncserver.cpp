@@ -10,13 +10,11 @@
 #include "../../include/helpers.h"
 
 AsyncWebServer server(80);
-extern struct_wifiInfo *wifiInfo;
 extern uint8_t count_wifiInfo;
 extern JsonDocument getCurrentSensorData();
 extern char ROOT_DIR[24];
 extern char AP_SSID[64];
 String pendingFileList = "{}";
-bool fileListReady = false;
 AsyncWebServerRequest *pendingRequest = nullptr;
 extern JsonDocument device_info;
 
@@ -31,8 +29,23 @@ void setup_webserver()
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
             { request->send(LittleFS, "/index.html"); });
   server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request)
-            { if(request->hasParam("skip")){DeviceConfigState.captivePortalAccessed=true;} //? we don't care about the value of skip, so no need to parse it
-              else{request->send(LittleFS, "/config.html"); } });
+            {
+              if (request->hasParam("skip")) {
+                  DeviceConfigState.captivePortalAccessed = true;
+                  // Skip the configuration page and send a simple response
+                  request->send(200, "text/plain", "Skipped");
+                  return;
+              }
+
+              // Check if config.html exists in LittleFS
+              if (LittleFS.exists("/config.html")) {
+                  Serial.println("Serving config.html from LittleFS");
+                  request->send(LittleFS, "/config.html", "text/html");
+              } else {
+                  // Fallback
+                  Serial.println("config.html missing from LittleFS");
+                  request->send(404, "text/plain", "Configuration page missing.");
+              } });
   server.on("/device-details.html", HTTP_GET, [](AsyncWebServerRequest *request)
             { request->send(LittleFS, "/device-details.html"); });
   server.on("/ota.html", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -61,23 +74,74 @@ void setup_webserver()
         String data_str;
         serializeJson(data,data_str);
         request->send(200,"application/json",data_str); });
+
   server.on("/available-hotspots", HTTP_GET, [](AsyncWebServerRequest *request)
             {
-                  JsonDocument doc;
-                  Serial.print("Wifi hotspots: ");
-                  Serial.println(count_wifiInfo);
-                  for (uint8_t i = 0; i < count_wifiInfo; i++)
-                  {
-                    Serial.println(wifiInfo[i].ssid);
-                    JsonObject SSID = doc[wifiInfo[i].ssid].to<JsonObject>();
-                    SSID["rssi"] = wifiInfo[i].RSSI;
-                    SSID["encType"] = wifiInfo[i].encryptionType;
-                  }
+              JsonDocument doc;
 
-                  String hotspots;
-                  // serializeJsonPretty(doc,Serial); // Debugging
-                  serializeJson(doc, hotspots);
-                  request->send(200,"application/json",hotspots); });
+              int16_t numNetworks = WiFi.scanComplete();
+
+              if (numNetworks == WIFI_SCAN_RUNNING)
+              {
+                request->send(202, "application/json", "{\"status\":\"scanning\"}");
+                return;
+              }
+
+              if (numNetworks < 0)
+              {
+                numNetworks = WiFi.scanNetworks(false, true, false, 100);
+              }
+
+              Serial.printf("Serving %d hotspots as keyed objects\n", numNetworks);
+
+              for (int i = 0; i < numNetworks; i++)
+              {
+                String ssid = WiFi.SSID(i);
+                if (ssid.length() == 0)
+                  continue;
+
+                // Convert the encryption integer to a human-readable string
+                String encString = "Open";
+                switch (WiFi.encryptionType(i))
+                {
+                case WIFI_AUTH_WEP:
+                  encString = "WEP";
+                  break;
+                case WIFI_AUTH_WPA_PSK:
+                  encString = "WPA";
+                  break;
+                case WIFI_AUTH_WPA2_PSK:
+                  encString = "WPA2";
+                  break;
+                case WIFI_AUTH_WPA_WPA2_PSK:
+                  encString = "WPA/WPA2";
+                  break;
+                case WIFI_AUTH_WPA3_PSK:
+                  encString = "WPA3";
+                  break;
+                default:
+                  encString = "Other";
+                  break;
+                }
+
+                // Create a nested object using the SSID as the key
+                JsonObject networkDetails = doc[ssid].to<JsonObject>();
+                networkDetails["rssi"] = WiFi.RSSI(i);
+                networkDetails["encType"] = encString;
+              }
+
+              String hotspots;
+              serializeJson(doc, hotspots);
+
+              Serial.printf("Hotspots JSON size: %d bytes\n", hotspots.length());
+              Serial.println(hotspots);
+
+              request->send(200, "application/json", hotspots);
+
+              // Kick off a fresh background scan after responding
+              // so the NEXT time the user refreshes, the data is perfectly up-to-date.
+              WiFi.scanNetworks(true, true); // 'true' makes it asynchronous background task
+            });
 
   server.on("/save-config", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
             {
@@ -142,46 +206,11 @@ void setup_webserver()
 
   server.on("/list-files", HTTP_GET, [](AsyncWebServerRequest *request)
             {
-              if (fileListReady && pendingRequest == nullptr)
-              {
-                // Previous result is ready, send it
-                request->send(200, "application/json", pendingFileList);
-                return;
-              }
+      // Always generate a fresh list.
+      // This ensures new files created by the logger are visible immediately.
+      String currentFileList = listFiles(SD, String(ROOT_DIR));
 
-              if (pendingRequest != nullptr)
-              {
-                // Another request is already being processed
-                request->send(503, "text/plain", "Server busy, try again later");
-                return;
-              }
-
-              // Store the request and start the task
-              pendingRequest = request;
-              fileListReady = false;
-
-              xTaskCreatePinnedToCore(
-                  [](void *param)
-                  {
-                    // Get the file list
-                    pendingFileList = listFiles(SD, String(ROOT_DIR));
-                    fileListReady = true;
-
-                    // Send the response
-                    if (pendingRequest != nullptr)
-                    {
-                      pendingRequest->send(200, "application/json", pendingFileList);
-                      pendingRequest = nullptr;
-                    }
-
-                    vTaskDelete(NULL);
-                  },
-                  "SDListTask",
-                  8192,
-                  nullptr,
-                  1,
-                  nullptr,
-                  1); });
+      request->send(200, "application/json", currentFileList); });
 
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request)
             {
